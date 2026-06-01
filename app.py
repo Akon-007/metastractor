@@ -27,22 +27,40 @@ def _normalize_value(value):
 
 
 def get_image_metadata(file_path):
+    """Extracts EXIF metadata from an image file."""
     metadata = {}
     try:
         with Image.open(file_path) as img:
-            metadata["Format"] = img.format
-            metadata["Width"] = img.width
-            metadata["Height"] = img.height
-            metadata["Mode"] = img.mode
-
+            # Basic info
+            metadata['Format'] = img.format
+            metadata['Width'] = img.width
+            metadata['Height'] = img.height
+            metadata['Mode'] = img.mode
+            
+            # EXIF data
             exif_data = img._getexif()
             if exif_data:
-                metadata["EXIF"] = {}
                 for tag_id, value in exif_data.items():
                     tag_name = TAGS.get(tag_id, tag_id)
-                    metadata["EXIF"][str(tag_name)] = _normalize_value(value)
-    except Exception as error:
-        metadata["Error"] = f"Could not extract image metadata: {error}"
+                    
+                    # --- CRASH FIX HERE ---
+                    # Handle custom Pillow data structures (IFDRational, bytes, etc.)
+                    if isinstance(value, bytes):
+                        value = value.decode(errors='replace')
+                    elif hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+                        # Convert fractional structures safely to float or string
+                        if value.denominator != 0:
+                            value = float(value.numerator) / value.denominator
+                        else:
+                            value = str(value)
+                    elif type(value).__name__ in ['IFDRational', 'TiffImagePlugin.IFDRational']:
+                        value = str(value)
+                    # ----------------------
+                    
+                    metadata[str(tag_name)] = value
+                    
+    except Exception as e:
+        metadata['Error'] = f"Could not extract image metadata: {str(e)}"
     return metadata
 
 
