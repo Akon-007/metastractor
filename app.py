@@ -147,10 +147,29 @@ def main():
 
     if metadata_results:
         st.subheader("📋 Extracted Metadata")
-        st.json(metadata_results)
+        
+        # 1. Isolate the standard, generic image properties if they exist
+        core_keys = ['Format', 'Width', 'Height', 'Mode']
+        core_props = {k: metadata_results[k] for k in core_keys if k in metadata_results}
+        
+        # 2. Keep all other complex/deep hardware artifacts separate
+        exif_props = {k: v for k, v in metadata_results.items() if k not in core_keys}
+        
+        # 3. Always display basic properties cleanly
+        st.markdown("#### 🖼️ Core File Properties")
+        st.json(core_props)
+        
+        # 4. Elegantly handle if deep data is missing (stripped) or present
+        st.markdown("#### 🔐 Deep Hardware & Timeline Data")
+        if exif_props:
+            st.json(exif_props)
+        else:
+            st.info("No deep EXIF tags found in this file header. This file has likely been stripped or optimized by a web platform.")
+        
     else:
         st.warning("No metadata could be extracted from this file.")
 
+    # --- THIS PART SITS OUTSIDE THE IF/ELSE BLOCKS ---
     st.subheader("💾 Download Metadata")
     json_string = json.dumps(metadata_results, indent=2)
     st.download_button(
