@@ -1,9 +1,10 @@
 import json
 import os
 import tempfile
+import re
 import streamlit as st
 from PIL import Image
-from PIL.ExifTags import TAGS
+from PIL.ExifTags import TAGS, GPSTAGS
 from hachoir.parser import createParser
 from hachoir.metadata import extractMetadata
 from hachoir.core import config as hachoir_config
@@ -26,6 +27,54 @@ def _normalize_value(value):
     return value
 
 
+def get_gps_coordinates(exif_data):
+    """Extracts and converts GPS metadata to standard decimal degrees."""
+    gps_info = {}
+    
+    # Locate the nested GPS tag dictionary
+    for tag_id, value in exif_data.items():
+        tag_name = TAGS.get(tag_id, tag_id)
+        if tag_name == 'GPSInfo':
+            gps_info = value
+            break
+            
+    if not gps_info:
+        return None
+
+    # Resolve GPS tag numerical references to string tags
+    resolved_gps = {}
+    for key in gps_info.keys():
+        name = GPSTAGS.get(key, key)
+        resolved_gps[name] = gps_info[key]
+
+    def _convert_to_degrees(value):
+        """Helper to convert the EXIF rational values to decimal degrees."""
+        try:
+            # Handle standard Pillow Exif Rational tuples
+            d = float(value[0].numerator) / value[0].denominator if hasattr(value[0], 'numerator') else float(value[0])
+            m = float(value[1].numerator) / value[1].denominator if hasattr(value[1], 'numerator') else float(value[1])
+            s = float(value[2].numerator) / value[2].denominator if hasattr(value[2], 'numerator') else float(value[2])
+            return d + (m / 60.0) + (s / 3600.0)
+        except Exception:
+            return None
+
+    lat_data = resolved_gps.get('GPSLatitude')
+    lat_ref = resolved_gps.get('GPSLatitudeRef')
+    lon_data = resolved_gps.get('GPSLongitude')
+    lon_ref = resolved_gps.get('GPSLongitudeRef')
+
+    if lat_data and lat_ref and lon_data and lon_ref:
+        lat = _convert_to_degrees(lat_data)
+        lon = _convert_to_degrees(lon_data)
+        
+        if lat is not None and lon is not None:
+            if str(lat_ref).strip().upper() != 'N': lat = -lat
+            if str(lon_ref).strip().upper() != 'E': lon = -lon
+            return {"Latitude": lat, "Longitude": lon}
+            
+    return None
+
+
 def get_image_metadata(file_path):
     """Extracts EXIF metadata from an image file."""
     metadata = {}
@@ -38,8 +87,20 @@ def get_image_metadata(file_path):
             
             exif_data = img._getexif()
             if exif_data:
+                # 1. Parse and isolate precise geolocation blocks
+                gps_coords = get_gps_coordinates(exif_data)
+                if gps_coords:
+                    metadata['GPSLatitude'] = gps_coords['Latitude']
+                    metadata['GPSLongitude'] = gps_coords['Longitude']
+                    metadata['GPSPosition'] = f"{gps_coords['Latitude']}, {gps_coords['Longitude']}"
+
+                # 2. Extract standard structural values
                 for tag_id, value in exif_data.items():
                     tag_name = TAGS.get(tag_id, tag_id)
+                    
+                    # Prevent dumping raw nested dictionary back into strings
+                    if tag_name == 'GPSInfo':
+                        continue
                     
                     if isinstance(value, bytes):
                         value = value.decode(errors='replace')
@@ -84,14 +145,101 @@ def get_video_metadata(file_path):
             if not extracted:
                 return {"Error": "Metadata extraction failed or returned empty."}
 
+            # Capture explicit plaintext representation before dictionary conversion drops blocks
+            plain_text_lines = []
+            try:
+                plain_text_lines = extracted.exportPlainString().split("\n")
+            except Exception:
+                pass
+
             try:
                 raw = extracted.exportDictionary()
-                metadata = _flatten_metadata(raw)
+                flat = _flatten_metadata(raw)
+                metadata.update(flat)
             except Exception:
-                for line in extracted.exportPlainString().split("\n"):
+                for line in plain_text_lines:
                     if ":" in line:
                         key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip()
+                        metadata[key.replace("- ", "").strip()] = value.strip()
+
+            def _parse_coord(value):
+                if not isinstance(value, str):
+                    if isinstance(value, (int, float)):
+                        return float(value)
+                    return None
+                
+                v = value.strip()
+                if not v:
+                    return None
+
+                # Pattern 1: ISO 6709 Format Match (+51.4778-0.0015/ or +27.1751+078.0421)
+                iso_match = re.match(r"^([+-][0-9.]+)([+-][0-9.]+)(?:/)?$", v)
+                if iso_match:
+                    try:
+                        return float(iso_match.group(1)), float(iso_match.group(2))
+                    except ValueError:
+                        pass
+
+                # Pattern 2: Comma-separated floats ("6.6432, 3.4211")
+                if ',' in v:
+                    try:
+                        parts = [p.strip() for p in v.split(',')]
+                        if len(parts) >= 2:
+                            return float(parts[0]), float(parts[1])
+                    except ValueError:
+                        pass
+
+                # Pattern 3: Standard DMS format (e.g. 12°34'56" N)
+                dms_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\D+([0-9]+(?:\.[0-9]+)?)\D+([0-9]+(?:\.[0-9]+)?)\D*([NSEW])", v, re.I)
+                if dms_match:
+                    try:
+                        dd = float(dms_match.group(1)) + float(dms_match.group(2)) / 60.0 + float(dms_match.group(3)) / 3600.0
+                        if dms_match.group(4).upper() in ('S', 'W'):
+                            dd = -dd
+                        return dd
+                    except ValueError:
+                        pass
+                return None
+
+            lat, lon = None, None
+
+            # Process plain text logs directly for dropped geolocation tags
+            for line in plain_text_lines:
+                cleaned_line = line.replace("- ", "").strip()
+                if ":" in cleaned_line:
+                    k, v = cleaned_line.split(":", 1)
+                    kl = k.lower()
+                    if any(x in kl for x in ('location', 'gps', 'position', 'xyz', 'coordinate')):
+                        parsed = _parse_coord(v.strip())
+                        if isinstance(parsed, tuple):
+                            lat, lon = parsed
+                            break
+
+            # Fallback evaluation on current metadata matrix dictionary values
+            if lat is None or lon is None:
+                for k, v in list(metadata.items()):
+                    lk = k.lower()
+                    if any(x in lk for x in ('location', 'gpsposition', 'gps coordinate', 'xyz')):
+                        parsed = _parse_coord(v)
+                        if isinstance(parsed, tuple):
+                            lat, lon = parsed
+                            break
+
+            if lat is None or lon is None:
+                for k, v in list(metadata.items()):
+                    lk = k.lower()
+                    if 'gpslatitude' in lk or lk == 'latitude':
+                        res = _parse_coord(v)
+                        lat = res if isinstance(res, float) else (res[0] if isinstance(res, tuple) else lat)
+                    if 'gpslongitude' in lk or lk == 'longitude':
+                        res = _parse_coord(v)
+                        lon = res if isinstance(res, float) else (res[1] if isinstance(res, tuple) else lon)
+
+            if lat is not None and lon is not None:
+                metadata['GPSLatitude'] = float(lat)
+                metadata['GPSLongitude'] = float(lon)
+                metadata['GPSPosition'] = f"{lat}, {lon}"
+
     except Exception as error:
         metadata["Error"] = f"Could not extract video metadata: {error}"
     return metadata
@@ -118,44 +266,30 @@ def render_metadata_row(key, value, category):
 
 
 def main():
-    # 1. Premium Dark Architecture Page Init
     st.set_page_config(page_title="METASTRACTOR // Pro Forensics Engine", page_icon="🔍", layout="wide")
     
-    # Injection of comprehensive web-app product layout styles
     st.markdown("""
         <style>
-        /* Main application background reset */
         .main { background-color: #07090E !important; }
         [data-testid="stSidebar"] { background-color: #0B0E14 !important; border-right: 1px solid #1A1F2C; }
-        
-        /* Premium Core Font Rules */
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
         html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
-        
-        /* File Uploader UI Overhaul */
         div[data-testid="stFileUploader"] { background-color: #0D1117; border: 1px dashed #2A3447; border-radius: 6px; padding: 20px; box-shadow: inset 0 2px 4px rgba(0,0,0,0.3); }
         div[data-testid="stFileUploader"] section { background-color: transparent !important; }
-        
-        /* Metric Card Overhaul */
         div[data-testid="stMetric"] { background-color: #0D1117; border: 1px solid #1A1F2C; padding: 14px 18px; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
         div[data-testid="stMetricValue"] { color: #4A7E9F !important; font-family: 'SF Mono', monospace !important; font-size: 22px !important; font-weight: 700 !important; }
         div[data-testid="stMetricLabel"] { color: #5B90AB !important; font-size: 11px !important; font-weight: 600 !important; text-transform: uppercase; letter-spacing: 0.75px; }
-        
-        /* Download Button Customizing */
         div.stButton > button { background-color: #10B981 !important; color: #ffffff !important; font-family: 'Inter', sans-serif !important; font-weight: 600 !important; font-size: 13px !important; border: none !important; border-radius: 4px !important; padding: 12px 24px !important; transition: all 0.2s ease-in-out; width: 100%; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2); }
         div.stButton > button:hover { background-color: #059669 !important; transform: translateY(-1px); box-shadow: 0 6px 16px rgba(16, 185, 129, 0.3); }
         </style>
     """, unsafe_allow_html=True)
 
-    # 2. Sidebar Navigation Panel
     with st.sidebar:
         st.markdown("<div style='padding: 10px 0;'><span style='font-family: monospace; font-size: 11px; color: #475569; letter-spacing: 1px;'>SYSTEM INSTANCE</span></div>", unsafe_allow_html=True)
         st.markdown("<h2 style='color: #2F6B8C; font-size: 16px; margin-top:-5px; font-weight:600;'>📊 METASTRACTOR PRO</h2>", unsafe_allow_html=True)
         st.markdown("<div style='border-bottom: 1px solid #1A1F2C; margin-bottom: 15px;'></div>", unsafe_allow_html=True)
-        
         st.markdown("CORE STATUS: <span style='color:#10B981; font-family:monospace; font-weight:600; font-size:12px; margin-left:5px;'>● ACTIVE</span>", unsafe_allow_html=True)
         st.markdown("SECURITY MODEL: <span style='color:#94A3B8; font-family:monospace; font-size:12px; margin-left:5px;'>ISOLATED_ENV</span>", unsafe_allow_html=True)
-        
         st.markdown("<div style='margin-top: 30px;'><span style='font-family: monospace; font-size: 11px; color: #475569; letter-spacing: 1px;'>LAYER SCHEMATIC</span></div>", unsafe_allow_html=True)
         st.markdown("<div style='background-color: #07090E; padding: 12px; border-radius: 6px; border: 1px solid #1A1F2C; margin-top:5px;'>"
                     "<div style='margin-bottom: 8px;'><span style='color:#00E5FF; font-size:14px; margin-right:8px;'>■</span><span style='color:#E2E8F0; font-size:12px;'>File Architecture</span></div>"
@@ -164,12 +298,10 @@ def main():
                     "<div><span style='color:#FF007F; font-size:14px; margin-right:8px;'>■</span><span style='color:#E2E8F0; font-size:12px;'>GPS Telemetry Maps</span></div>"
                     "</div>", unsafe_allow_html=True)
 
-    # 3. Main Dashboard Header
     st.markdown("<h1 style='color: #4A7E9F; font-size: 26px; font-weight: 700; margin-bottom: 4px; letter-spacing: -0.5px;'>File Stream Metadata Inspector</h1>", unsafe_allow_html=True)
     st.markdown("<p style='color: #5B90AB; font-size: 14px; margin-bottom: 25px;'>Enterprise digital forensics platform for deep packet byte-signature parsing and immutable file-layer verification.</p>", unsafe_allow_html=True)
     st.markdown("<div style='border-bottom: 1px solid #1A1F2C; margin-bottom: 30px;'></div>", unsafe_allow_html=True)
 
-    # Split workspace into an clean unbalanced 1:2 column grid layout
     col1, col2 = st.columns([5, 11], gap="large")
 
     with col1:
@@ -190,7 +322,6 @@ def main():
         
         st.markdown(f"<div style='background-color:#0D1117; padding:12px 16px; border-radius: 4px; border: 1px solid #10B981; font-family:monospace; font-size:12px; color:#4A7E9F; font-weight: 500; box-shadow: 0 4px 12px rgba(16,185,129,0.05);'>📄 READY: {file_name}</div>", unsafe_allow_html=True)
 
-    # 4. Processing Engine Block
     with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp_file:
         tmp_file.write(uploaded_file.getbuffer())
         temp_path = tmp_file.name
@@ -209,12 +340,10 @@ def main():
             if os.path.exists(temp_path): os.remove(temp_path)
         except: pass
 
-    # 5. Categorized UI Output Dashboard Display
     with col2:
         if metadata_results:
             st.markdown("<h3 style='color: #2F6B8C; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;'>📊 Analysis Real-Time Manifest</h3>", unsafe_allow_html=True)
             
-            # Telemetry metrics resolution filters
             fmt_val = str(metadata_results.get('Format', extension.upper().replace('.', '')))
             w_val = str(metadata_results.get('Width', metadata_results.get('Metadata.Image width', '—'))).replace(' pixels', '')
             h_val = str(metadata_results.get('Height', metadata_results.get('Metadata.Image height', '—'))).replace(' pixels', '')
@@ -226,63 +355,66 @@ def main():
 
             st.markdown("<div style='margin: 20px 0;'></div>", unsafe_allow_html=True)
 
-            # Functional Categorization Layer Arrays
             structure_data = {}
             hardware_data = {}
             identity_data = {}
             location_data = {}
 
-            # Strict architecture target routing filters
             struct_targets = {'Format', 'Width', 'Height', 'Mode', 'BitsPerSample', 'Compression', 'ImageWidth', 'ImageLength'}
             hardware_targets = {'Make', 'Model', 'Software', 'FNumber', 'ExposureTime', 'ISOSpeedRatings', 'FocalLength', 'LensModel', 'WhiteBalance', 'Flash', 'ResolutionUnit', 'XResolution', 'YResolution'}
             identity_targets = {'DateTime', 'DateTimeOriginal', 'DateTimeDigitized', 'Artist', 'Copyright', 'ImageDescription', 'OffsetTime', 'OffsetTimeOriginal', 'OffsetTimeDigitized'}
-            location_targets = {'GPSInfo', 'GPSLatitude', 'GPSLongitude', 'GPSPosition'}
+            location_targets = {'GPSLatitude', 'GPSLongitude', 'GPSPosition'}
 
             for k, v in metadata_results.items():
-                if k in struct_targets or "width" in k.lower() or "height" in k.lower() or "mime" in k.lower() or "duration" in k.lower() or "endian" in k.lower():
-                    structure_data[k] = v
-                elif k in hardware_targets or "codec" in k.lower():
-                    hardware_data[k] = v
-                elif k in identity_targets or "date" in k.lower() or "comment" in k.lower():
-                    identity_data[k] = v
-                elif k in location_targets or "gps" in k.lower():
+                kl = k.lower()
+                if k in location_targets or "gps" in kl:
                     location_data[k] = v
+                elif k in hardware_targets or any(x in kl for x in ('codec', 'encoder', 'agency', 'hardware', 'model', 'manufacturer')):
+                    hardware_data[k] = v
+                elif k in struct_targets or any(x in kl for x in ('width', 'height', 'mime', 'duration', 'endian', 'frame rate', 'bit rate', 'aspect ratio')):
+                    structure_data[k] = v
+                elif k in identity_targets or any(x in kl for x in ('date', 'comment', 'copyright')):
+                    identity_data[k] = v
                 else:
                     structure_data[k] = v
 
-            # Premium Outer Frame Data Matrix Container Block
             st.markdown("<div style='border: 1px solid #1A1F2C; border-radius: 6px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.3);'>", unsafe_allow_html=True)
             
-            # --- SECTION 1: ARCHITECTURE ---
             if structure_data:
                 st.markdown("<div style='background-color: #111622; padding: 10px 16px; font-size: 11px; font-weight: 700; color: #00E5FF; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1A1F2C;'>[01] // File Structure Layer</div>", unsafe_allow_html=True)
                 for k, v in structure_data.items():
                     render_metadata_row(k, v, "structure")
 
-            # --- SECTION 2: HARDWARE ---
             if hardware_data:
                 st.markdown("<div style='background-color: #111622; padding: 10px 16px; font-size: 11px; font-weight: 700; color: #FFB300; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1A1F2C; border-top: 1px solid #1A1F2C;'>[02] // EXIF Sensor Hardware Layer</div>", unsafe_allow_html=True)
                 for k, v in hardware_data.items():
                     render_metadata_row(k, v, "hardware")
 
-            # --- SECTION 3: TIMELINE / IDENTITY ---
             if identity_data:
                 st.markdown("<div style='background-color: #111622; padding: 10px 16px; font-size: 11px; font-weight: 700; color: #00E676; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1A1F2C; border-top: 1px solid #1A1F2C;'>[03] // Identity & Temporal Stamps</div>", unsafe_allow_html=True)
                 for k, v in identity_data.items():
                     render_metadata_row(k, v, "identity")
 
-            # --- SECTION 4: GPS TELEMETRY ---
             if location_data:
                 st.markdown("<div style='background-color: #111622; padding: 10px 16px; font-size: 11px; font-weight: 700; color: #FF007F; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1A1F2C; border-top: 1px solid #1A1F2C;'>[04] // Geolocation Tracking Matrix</div>", unsafe_allow_html=True)
                 for k, v in location_data.items():
                     render_metadata_row(k, v, "location")
-            elif extension in IMAGE_EXTENSIONS and not location_data:
+            else:
                 st.markdown("<div style='background-color: #111622; padding: 10px 16px; font-size: 11px; font-weight: 700; color: #475569; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #1A1F2C; border-top: 1px solid #1A1F2C;'>[04] // Geolocation Tracking Matrix</div>", unsafe_allow_html=True)
                 st.markdown("<div style='padding: 14px 16px; font-family: monospace; font-size: 11px; color: #475569; background-color:#0D1117;'>No embedded GPS layers found inside this metadata block structure.</div>", unsafe_allow_html=True)
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # 6. Action Export Manifest Generation System
+            if 'GPSLatitude' in metadata_results and 'GPSLongitude' in metadata_results:
+                st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
+                st.markdown("<h3 style='color: #FF007F; font-size: 14px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;'>🗺️ Target Mapping Spatial Coordinates</h3>", unsafe_allow_html=True)
+                
+                map_data = {
+                    'lat': [metadata_results['GPSLatitude']],
+                    'lon': [metadata_results['GPSLongitude']]
+                }
+                st.map(map_data, zoom=13)
+
             st.markdown("<div style='margin-top: 25px;'></div>", unsafe_allow_html=True)
             json_string = json.dumps(metadata_results, indent=2)
             st.download_button(
